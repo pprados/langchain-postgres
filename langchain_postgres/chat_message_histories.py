@@ -2,21 +2,16 @@
 
 This client provides support for both sync and async via psycopg 3.
 """
-from __future__ import annotations
-
-import json
 import logging
-import re
-import uuid
-from typing import List, Optional, Sequence
+
+from typing import Optional, Union, List
 
 import psycopg
-from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_core.messages import BaseMessage, message_to_dict, messages_from_dict
 from psycopg import sql
+from langchain_community.chat_message_histories import SQLChatMessageHistory
+from langchain_core._api import deprecated
 
 logger = logging.getLogger(__name__)
-
 
 def _create_table_and_index(table_name: str) -> List[sql.Composed]:
     """Make a SQL query to create a table."""
@@ -43,23 +38,6 @@ def _create_table_and_index(table_name: str) -> List[sql.Composed]:
     return statements
 
 
-def _get_messages_query(table_name: str) -> sql.Composed:
-    """Make a SQL query to get messages for a given session."""
-    return sql.SQL(
-        "SELECT message "
-        "FROM {table_name} "
-        "WHERE session_id = %(session_id)s "
-        "ORDER BY id;"
-    ).format(table_name=sql.Identifier(table_name))
-
-
-def _delete_by_session_id_query(table_name: str) -> sql.Composed:
-    """Make a SQL query to delete messages for a given session."""
-    return sql.SQL(
-        "DELETE FROM {table_name} WHERE session_id = %(session_id)s;"
-    ).format(table_name=sql.Identifier(table_name))
-
-
 def _delete_table_query(table_name: str) -> sql.Composed:
     """Make a SQL query to delete a table."""
     return sql.SQL("DROP TABLE IF EXISTS {table_name};").format(
@@ -67,14 +45,8 @@ def _delete_table_query(table_name: str) -> sql.Composed:
     )
 
 
-def _insert_message_query(table_name: str) -> sql.Composed:
-    """Make a SQL query to insert a message."""
-    return sql.SQL(
-        "INSERT INTO {table_name} (session_id, message) VALUES (%s, %s)"
-    ).format(table_name=sql.Identifier(table_name))
-
-
-class PostgresChatMessageHistory(BaseChatMessageHistory):
+@deprecated(since="0.0.8", removal="3.0.0", pending=False)
+class PostgresChatMessageHistory(SQLChatMessageHistory):
     def __init__(
         self,
         table_name: str,
@@ -183,26 +155,19 @@ class PostgresChatMessageHistory(BaseChatMessageHistory):
         """
         if not sync_connection and not async_connection:
             raise ValueError("Must provide sync_connection or async_connection")
-
-        self._connection = sync_connection
-        self._aconnection = async_connection
-
-        # Validate that session id is a UUID
-        try:
-            uuid.UUID(session_id)
-        except ValueError:
-            raise ValueError(
-                f"Invalid session id. Session id must be a valid UUID. Got {session_id}"
-            )
-
-        self._session_id = session_id
-
-        if not re.match(r"^\w+$", table_name):
-            raise ValueError(
-                "Invalid table name. Table name must contain only alphanumeric "
-                "characters and underscores."
-            )
-        self._table_name = table_name
+        connection: Union[psycopg.Connection, psycopg.AsyncConnection]
+        if async_connection:
+            connection = async_connection
+            async_mode = True
+        elif sync_connection:
+            connection = sync_connection
+            async_mode = False
+        super().__init__(
+            table_name=table_name,
+            session_id=session_id,
+            connection=connection,
+            async_mode=async_mode,
+        )
 
     @staticmethod
     def create_tables(
@@ -269,104 +234,3 @@ class PostgresChatMessageHistory(BaseChatMessageHistory):
         async with connection.cursor() as acur:
             await acur.execute(query)
         await connection.commit()
-
-    def add_messages(self, messages: Sequence[BaseMessage]) -> None:
-        """Add messages to the chat message history."""
-        if self._connection is None:
-            raise ValueError(
-                "Please initialize the PostgresChatMessageHistory "
-                "with a sync connection or use the aadd_messages method instead."
-            )
-
-        values = [
-            (self._session_id, json.dumps(message_to_dict(message)))
-            for message in messages
-        ]
-
-        query = _insert_message_query(self._table_name)
-
-        with self._connection.cursor() as cursor:
-            cursor.executemany(query, values)
-        self._connection.commit()
-
-    async def aadd_messages(self, messages: Sequence[BaseMessage]) -> None:
-        """Add messages to the chat message history."""
-        if self._aconnection is None:
-            raise ValueError(
-                "Please initialize the PostgresChatMessageHistory "
-                "with an async connection or use the sync add_messages method instead."
-            )
-
-        values = [
-            (self._session_id, json.dumps(message_to_dict(message)))
-            for message in messages
-        ]
-
-        query = _insert_message_query(self._table_name)
-        async with self._aconnection.cursor() as cursor:
-            await cursor.executemany(query, values)
-        await self._aconnection.commit()
-
-    def get_messages(self) -> List[BaseMessage]:
-        """Retrieve messages from the chat message history."""
-        if self._connection is None:
-            raise ValueError(
-                "Please initialize the PostgresChatMessageHistory "
-                "with a sync connection or use the async aget_messages method instead."
-            )
-
-        query = _get_messages_query(self._table_name)
-
-        with self._connection.cursor() as cursor:
-            cursor.execute(query, {"session_id": self._session_id})
-            items = [record[0] for record in cursor.fetchall()]
-
-        messages = messages_from_dict(items)
-        return messages
-
-    async def aget_messages(self) -> List[BaseMessage]:
-        """Retrieve messages from the chat message history."""
-        if self._aconnection is None:
-            raise ValueError(
-                "Please initialize the PostgresChatMessageHistory "
-                "with an async connection or use the sync get_messages method instead."
-            )
-
-        query = _get_messages_query(self._table_name)
-        async with self._aconnection.cursor() as cursor:
-            await cursor.execute(query, {"session_id": self._session_id})
-            items = [record[0] for record in await cursor.fetchall()]
-
-        messages = messages_from_dict(items)
-        return messages
-
-    @property  # type: ignore[override]
-    def messages(self) -> List[BaseMessage]:
-        """The abstraction required a property."""
-        return self.get_messages()
-
-    def clear(self) -> None:
-        """Clear the chat message history for the GIVEN session."""
-        if self._connection is None:
-            raise ValueError(
-                "Please initialize the PostgresChatMessageHistory "
-                "with a sync connection or use the async clear method instead."
-            )
-
-        query = _delete_by_session_id_query(self._table_name)
-        with self._connection.cursor() as cursor:
-            cursor.execute(query, {"session_id": self._session_id})
-        self._connection.commit()
-
-    async def aclear(self) -> None:
-        """Clear the chat message history for the GIVEN session."""
-        if self._aconnection is None:
-            raise ValueError(
-                "Please initialize the PostgresChatMessageHistory "
-                "with an async connection or use the sync clear method instead."
-            )
-
-        query = _delete_by_session_id_query(self._table_name)
-        async with self._aconnection.cursor() as cursor:
-            await cursor.execute(query, {"session_id": self._session_id})
-        await self._aconnection.commit()
